@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Move a Running Pod Between Kubernetes Nodes and Survive Spot Instance Reclaims</title>
+<meta name="description" content="Freeze a live pod with CRIU, carry it off a dying spot node, and restore it on another one — by hand, on kind. A hands-on preview of Kubernetes KEP-5823.">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1b1f24;
+    --muted: #57606a;
+    --accent: #0969da;
+    --border: #d0d7de;
+    --code-inline-bg: #f0f2f5;
+    --table-stripe: #f6f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --border: #30363d;
+      --code-inline-bg: #1c2128;
+      --table-stripe: #161b22;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 18px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  main {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 3rem 1.25rem 5rem;
+  }
+  h1 {
+    font-size: 2.2rem;
+    line-height: 1.25;
+    margin: 0 0 1.5rem;
+    letter-spacing: -0.02em;
+  }
+  h2 {
+    font-size: 1.55rem;
+    line-height: 1.3;
+    margin: 2.5rem 0 1rem;
+    padding-top: 0.5rem;
+    letter-spacing: -0.01em;
+  }
+  h3 { font-size: 1.2rem; margin: 2rem 0 0.75rem; }
+  h2 a, h3 a { color: inherit; }
+  p { margin: 0 0 1.1rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  strong { font-weight: 650; }
+  ul, ol { padding-left: 1.6rem; margin: 0 0 1.1rem; }
+  li { margin-bottom: 0.35rem; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--code-inline-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 5px;
+  }
+  pre {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    margin: 0 0 1.1rem;
+    line-height: 1.55;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.82rem;
+    color: #e6edf3;
+  }
+  .diagram {
+    margin: 1.5rem 0;
+    text-align: center;
+  }
+  .diagram pre.mermaid {
+    background: transparent;
+    border: none;
+    display: flex;
+    justify-content: center;
+    overflow-x: auto;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0 0 1.1rem;
+    font-size: 0.95rem;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.5rem 0.8rem;
+    text-align: left;
+  }
+  th { background: var(--table-stripe); }
+  tr:nth-child(even) td { background: var(--table-stripe); }
+  @media (max-width: 640px) {
+    body { font-size: 16.5px; }
+    h1 { font-size: 1.7rem; }
+    h2 { font-size: 1.35rem; }
+    main { padding-top: 2rem; }
+  }
+</style>
+</head>
+<body>
+<main>
+<h1 id="how-to-move-a-running-pod-between-kubernetes-nodes-and-survive-spot-instance-reclaims">How to Move a Running Pod Between Kubernetes Nodes and Survive Spot Instance Reclaims</h1>
+<p>In this article, you&#39;ll freeze a live, running process inside a Kubernetes pod — its memory, its open sockets, its half-finished work — carry it off a dying node, and thaw it on another one, where it resumes as if nothing happened. Not with a vendor tool, and not by reading a design doc: you&#39;ll do every step by hand on a laptop with <a href="https://kind.sigs.k8s.io/">kind</a>.</p>
+<p>&quot;Pods are cattle, not pets&quot; is one of the great dogmas of Kubernetes. When a node dies, its pods die with it, and the scheduler starts <em>fresh copies</em> somewhere else. For stateless services that&#39;s fine. But a fresh copy of a training job is a job that lost three days of progress. A fresh copy of a warmed-up JVM is a JVM that spends the next ten minutes re-JIT-compiling everything. The pod spec survives — the <em>work</em> doesn&#39;t.</p>
+<p>Your laptop already solves this problem: close the lid, open it on the train, and every app resumes mid-keystroke. That&#39;s suspend and resume. Kubernetes is getting the same superpower — checkpoint/restore — and <a href="https://github.com/kubernetes/enhancements/issues/5823">KEP-5823 (Pod-level Checkpoint/Restore)</a> is the proposal that will make it a native API.</p>
+<p>By the end, you&#39;ll have checkpointed a stateful pod during a simulated spot-instance &quot;two-minute warning,&quot; killed its node mid-flight, salvaged the checkpoint off the dead node&#39;s disk, and watched the <em>same process</em> — same counter, same in-memory state, even the same internal clock — come back to life on a surviving node. And you&#39;ll understand exactly what KEP-5823 automates, because you&#39;ll have been the controller yourself.</p>
+<p>All the code and scripts are in the <a href="https://github.com/shkatara/k8s-criu">companion repo</a>.</p>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ul>
+<li><a href="#prerequisites">Prerequisites</a></li>
+<li><a href="#the-problem-spot-instances-are-a-discount-with-a-countdown-timer">The Problem: Spot Instances Are a Discount With a Countdown Timer</a></li>
+<li><a href="#the-idea-freeze-the-process-not-just-the-pod-spec">The Idea: Freeze the Process, Not Just the Pod Spec</a></li>
+<li><a href="#how-to-build-the-lab">How to Build the Lab</a></li>
+<li><a href="#give-the-pod-something-to-lose">Give the Pod Something to Lose</a></li>
+<li><a href="#the-two-minute-warning-checkpoint-the-container">The Two-Minute Warning: Checkpoint the Container</a></li>
+<li><a href="#the-reclaim-kill-the-node">The Reclaim: Kill the Node</a></li>
+<li><a href="#resurrection-from-tarball-to-running-pod">Resurrection: From Tarball to Running Pod</a></li>
+<li><a href="#what-just-happened-and-what-didnt">What Just Happened (and What Didn&#39;t)</a></li>
+<li><a href="#the-future-kep-5823-makes-this-native">The Future: KEP-5823 Makes This Native</a></li>
+<li><a href="#clean-up">Clean Up</a></li>
+<li><a href="#conclusion">Conclusion</a></li>
+</ul>
+<hr>
+<h2 id="prerequisites">Prerequisites</h2>
+<p>Before starting, make sure you have:</p>
+<ul>
+<li><a href="https://www.docker.com/">Docker</a> (or <a href="https://orbstack.dev/">OrbStack</a> on macOS) up and running</li>
+<li><a href="https://kind.sigs.k8s.io/">kind</a> <strong>v0.33.0 or newer</strong> — the demo is pinned to the <code>kindest/node:v1.37.0</code> image, which ships containerd 2.3.4</li>
+<li><a href="https://kubernetes.io/docs/tasks/tools/">kubectl</a></li>
+</ul>
+<p>You don&#39;t need a cloud account, and you don&#39;t need to know anything about CRIU — we&#39;ll build that knowledge as we go. The demo works on both amd64 and arm64 (Apple Silicon included), because we build our own tiny app image for whatever architecture your machine has.</p>
+<p><strong>Note:</strong> Checkpoint/restore reaches deep into the kernel, so exact versions matter more than usual in this article. Everything below is pinned and was validated end to end: Kubernetes v1.37.0, containerd 2.3.4, CRIU 4.2.1, kind v0.33.0. Where a version boundary matters, I&#39;ll tell you why.</p>
+<hr>
+<h2 id="the-problem-spot-instances-are-a-discount-with-a-countdown-timer">The Problem: Spot Instances Are a Discount With a Countdown Timer</h2>
+<p>Every major cloud sells you its spare capacity at a steep discount — commonly cited at up to 90% off on-demand prices. The catch is the same everywhere: the cloud can take the machine back whenever it wants, and it doesn&#39;t ask nicely.</p>
+<ul>
+<li><strong>AWS EC2 Spot</strong> gives you a <strong>2-minute interruption notice</strong>, delivered through the instance metadata service (<code>spot/instance-action</code>) and as an EventBridge event. AWS recommends polling the metadata endpoint every 5 seconds, and the notice is best-effort — sometimes the two minutes is all you get, sometimes not even that.</li>
+<li><strong>GCP Spot VMs</strong> send an ACPI shutdown signal and give you roughly <strong>30 seconds</strong>. GKE splits that window between regular and system-critical pods.</li>
+<li><strong>Azure Spot VMs</strong> surface the eviction through Scheduled Events with — again — about <strong>30 seconds</strong> of warning.</li>
+</ul>
+<p>Kubernetes has machinery to make this <em>graceful</em>: interruption handlers (aws-node-termination-handler, Karpenter) cordon and drain the node, and the kubelet&#39;s <a href="https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/">Graceful Node Shutdown</a> feature (beta since v1.21, inert until you set <code>shutdownGracePeriod</code>) holds the OS shutdown long enough to terminate pods in order.</p>
+<p>Look closely at what all of that machinery does, though: it <strong>kills your pods politely</strong>. Every one of those mechanisms ends with SIGTERM. The replacement pod starts from <code>ENTRYPOINT</code>, with empty memory.</p>
+<p>For a stateless web server, who cares. But consider what&#39;s actually in memory when the countdown starts:</p>
+<ul>
+<li><strong>ML training</strong>: everything since your last <code>torch.save()</code>. Checkpoint every 30 minutes and a reclaim costs you up to 30 minutes of GPU time — per interruption, per node.</li>
+<li><strong>JVM services</strong>: minutes of JIT compilation and cache warming. (This pain is so real that OpenJDK built <a href="https://openjdk.org/projects/crac/">Project CRaC</a> — <em>Coordinated Restore at Checkpoint</em> — which snapshots a warmed-up JVM using the same underlying tech we&#39;re about to use.)</li>
+<li><strong>In-memory caches, long-lived computations, stateful session brokers</strong>: gone.</li>
+</ul>
+<p>The standard fix is to teach every application to save and reload its own state. That works — it&#39;s also a per-application tax, paid forever.</p>
+<p>What if, instead of asking the application to save itself, the node could photograph the <em>entire process</em> — heap, stack, registers, open files, sockets — and rebuild it, atom by atom, somewhere else? The application wouldn&#39;t even need to know.</p>
+<p>That exists. It&#39;s called CRIU, and Kubernetes has been quietly wiring it in since v1.25.</p>
+<hr>
+<h2 id="the-idea-freeze-the-process-not-just-the-pod-spec">The Idea: Freeze the Process, Not Just the Pod Spec</h2>
+<p><a href="https://criu.org/">CRIU</a> (<strong>C</strong>heckpoint/<strong>R</strong>estore <strong>I</strong>n <strong>U</strong>serspace) is a Linux tool that can dump a running process tree to disk — memory pages, file descriptors, socket state, credentials, timers — and later restore it, on the same machine or a compatible one, so precisely that the process itself can&#39;t tell it happened.</p>
+<p>Kubernetes exposes this through <a href="https://kubernetes.io/blog/2022/12/05/forensic-container-checkpointing-alpha/">KEP-2008, <em>Forensic Container Checkpointing</em></a>: since v1.25 (alpha) and v1.30 (beta, <strong>enabled by default</strong>), every kubelet has a checkpoint endpoint:</p>
+<pre><code class="language-plaintext">POST https://&lt;node&gt;:10250/checkpoint/{namespace}/{pod}/{container}</code></pre>
+<p>One authenticated call, and the kubelet asks the container runtime to CRIU-dump the container into a tar archive under <code>/var/lib/kubelet/checkpoints/</code>. The container keeps running — the feature was designed for <em>forensics</em>, snapshotting a suspicious container without tipping off an attacker.</p>
+<p>Here&#39;s the gap: <strong>Kubernetes has no restore API yet.</strong> Checkpointing is a kubelet feature; restoring is, for now, a container-runtime trick. The trick, proven out by containerd&#39;s own test suite, goes like this: pack the checkpoint archive into an OCI image with a special annotation, and when a pod uses that image, containerd (2.1+) recognizes the annotation during <code>CreateContainer</code> and hands the archive to CRIU instead of starting a fresh process.</p>
+<p>That trick is exactly what we&#39;re going to run — by hand, step by step. It&#39;s also exactly the gap <a href="https://github.com/kubernetes/enhancements/issues/5823">KEP-5823</a> exists to close (much more on that at the end).</p>
+<h3 id="the-architecture">The Architecture</h3>
+<div class="diagram"><pre class="mermaid">graph TD
+    subgraph "kind cluster: checkpoint-lab"
+        subgraph "checkpoint-lab-worker (the doomed spot node)"
+            P1[counter pod&lt;br/&gt;in-memory state]
+            K1[kubelet :10250&lt;br/&gt;checkpoint API]
+            T1[checkpoint tar&lt;br/&gt;/var/lib/kubelet/checkpoints]
+            K1 -- "CRIU dump" --&gt; P1
+            K1 --&gt; T1
+        end
+        subgraph "checkpoint-lab-worker2 (the survivor)"
+            I2[containerd image store]
+            P2[counter-restored pod&lt;br/&gt;same process, revived]
+            I2 -- "CRIU restore on CreateContainer" --&gt; P2
+        end
+        CP[control-plane]
+    end
+    T1 -- "salvage: docker cp" --&gt; B[buildah:&lt;br/&gt;tar to OCI image&lt;br/&gt;+ restore annotation]
+    B -- "ctr images import" --&gt; I2</pre></div>
+<h3 id="the-flow">The Flow</h3>
+<ol>
+<li>A stateful <strong>counter app</strong> runs on <code>checkpoint-lab-worker</code>, our stand-in for a spot node, accumulating in-memory state.</li>
+<li>The &quot;two-minute warning&quot; fires. We call the <strong>kubelet checkpoint API</strong>, and CRIU dumps the container to a tar archive in ~300 milliseconds.</li>
+<li>The node <strong>dies</strong> (<code>docker stop</code>). We salvage the archive off its disk — the moral equivalent of detaching an EBS volume from a terminated instance.</li>
+<li><strong>buildah</strong> wraps the archive in an OCI image carrying the annotation <code>org.criu.checkpoint.container.name</code> — the secret handshake that tells containerd &quot;this image is a frozen process.&quot;</li>
+<li>We import the image on <code>checkpoint-lab-worker2</code> and create a pod from it. containerd sees the annotation and <strong>CRIU-restores</strong> the original process instead of starting a new one.</li>
+<li>The counter continues from where the checkpoint froze it.</li>
+</ol>
+<hr>
+<h2 id="how-to-build-the-lab">How to Build the Lab</h2>
+<h3 id="the-cluster">The cluster</h3>
+<p>Three nodes: a control plane, a worker that&#39;s going to die, and a worker that inherits its workload.</p>
+<pre><code class="language-yaml"># k8s/kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: checkpoint-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0
+  - role: worker
+    image: kindest/node:v1.37.0
+  - role: worker
+    image: kindest/node:v1.37.0</code></pre>
+<pre><code class="language-bash">kind create cluster --config k8s/kind-config.yaml
+kubectl get nodes -o wide</code></pre>
+<pre><code class="language-plaintext">NAME                           STATUS   ROLES           AGE   VERSION   ... CONTAINER-RUNTIME
+checkpoint-lab-control-plane   Ready    control-plane   60s   v1.37.0   ... containerd://2.3.4
+checkpoint-lab-worker          Ready    &lt;none&gt;          40s   v1.37.0   ... containerd://2.3.4
+checkpoint-lab-worker2         Ready    &lt;none&gt;          40s   v1.37.0   ... containerd://2.3.4</code></pre>
+<p>Note the runtime: <strong>containerd 2.3.4</strong>. That version matters twice over, as you&#39;ll see in a moment.</p>
+<p>The <code>ContainerCheckpoint</code> feature gate has been beta and on by default since v1.30, so the kubelet checkpoint endpoint needs <strong>zero configuration</strong>. It&#39;s already live on every node you just created.</p>
+<h3 id="the-app-something-worth-saving">The app: something worth saving</h3>
+<p>A checkpoint demo needs state you&#39;d be sad to lose. Here&#39;s a ~40-line Go server that hoards two kinds of it: a request <strong>counter</strong> in memory, and a 10-second <strong>warmup</strong> at startup that stands in for every model-load and JIT-compile you&#39;ve ever waited on.</p>
+<pre><code class="language-go">// app/main.go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+)
+
+var (
+	counter   int
+	startedAt = time.Now()
+)
+
+func main() {
+	// Simulate an expensive warmup: loading model weights, JIT compilation,
+	// filling an in-memory cache. This is the work a restored process skips.
+	warmup := 10
+	if v, err := strconv.Atoi(os.Getenv("WARMUP_SECONDS")); err == nil {
+		warmup = v
+	}
+	log.Printf("warming up for %ds...", warmup)
+	time.Sleep(time.Duration(warmup) * time.Second)
+	log.Println("ready to serve")
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		counter++
+		hostname, _ := os.Hostname()
+		fmt.Fprintf(w, "counter: %d | pod: %s | process up: %s\n",
+			counter, hostname, time.Since(startedAt).Round(time.Second))
+	})
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}</code></pre>
+<p>The Dockerfile is a standard two-stage build that ends in a <code>scratch</code> image — one static binary at <code>/counter</code>, nothing else:</p>
+<pre><code class="language-dockerfile"># app/Dockerfile
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -o /counter .
+
+FROM scratch
+COPY --from=build /counter /counter
+EXPOSE 8080
+ENTRYPOINT ["/counter"]</code></pre>
+<p>Build it into a minimal image and load it into the cluster:</p>
+<pre><code class="language-bash">docker build -t counter:blog app/
+kind load docker-image counter:blog --name checkpoint-lab</code></pre>
+<h3 id="criu-the-freeze-ray">CRIU: the freeze ray</h3>
+<p>kind&#39;s node image is Debian trixie and doesn&#39;t ship CRIU, but installing it is one <code>apt-get</code> inside each node container — no image rebuild needed. There&#39;s a twist, though: <strong>trixie&#39;s CRIU is 4.1.1, and that version cannot checkpoint TCP servers on Linux kernels 6.16 or newer.</strong> Kernel 6.16 restricted the <code>SO_PASSCRED</code>/<code>SO_PASSSEC</code> socket options to UNIX (and netlink/Bluetooth) sockets, and older CRIUs blindly query them on every socket and abort with <code>Operation not supported</code> (<a href="https://github.com/checkpoint-restore/criu/pull/2711">fixed in CRIU 4.2</a>). If your Docker VM runs a modern kernel — OrbStack does — 4.1.1 will fail exactly when it matters.</p>
+<p>So we install CRIU 4.2 from Debian unstable, pinned so nothing else upgrades:</p>
+<pre><code class="language-bash">for n in $(kind get nodes --name checkpoint-lab); do
+  docker exec "$n" bash -c '
+    echo "deb http://deb.debian.org/debian sid main" &gt; /etc/apt/sources.list.d/sid.list
+    printf "Package: *\nPin: release a=unstable\nPin-Priority: 100\n" &gt; /etc/apt/preferences.d/sid
+    apt-get update -qq &gt;/dev/null
+    apt-get install -y -qq criu/unstable checkpointctl &gt;/dev/null
+    criu --version &amp;&amp; criu check'
+done</code></pre>
+<pre><code class="language-plaintext">Version: 4.2.1
+Looks good.</code></pre>
+<p><code>criu check</code> probes the kernel for every feature CRIU needs. <strong>&quot;Looks good&quot; is your go/no-go gate</strong> — if it fails on your machine, run the demo in a Linux VM with a full kernel instead.</p>
+<h3 id="containerd-unlocking-restore">containerd: unlocking restore</h3>
+<p>Checkpoint support (the CRI <code>CheckpointContainer</code> call) landed in containerd 2.0. Restore-through-<code>CreateContainer</code> landed in 2.1. But containerd 2.2.7+/2.3.4+ ship restore <strong>disabled by default</strong> behind an experimental flag — partly because a checkpoint-image vulnerability (<a href="https://github.com/containerd/containerd/security/advisories/GHSA-33vj-92qq-66hc">GHSA-33vj-92qq-66hc</a>) showed how spicy restoring attacker-supplied archives can be, and partly because the deprecation notice tells you where this is all headed:</p>
+<pre><code class="language-plaintext">DEPRECATION: Restoring checkpoint data from an image or archive during CRI
+CreateContainer is deprecated and will be removed in containerd v2.4.</code></pre>
+<p>Removed in favor of what? KEP-5823&#39;s real <code>RestorePod</code> API. We&#39;re living in the window where the by-hand trick works — let&#39;s flip it on:</p>
+<pre><code class="language-bash">for n in $(kind get nodes --name checkpoint-lab); do
+  docker exec "$n" bash -c '
+    sed -i "s|^\[plugins.\"io.containerd.grpc.v1.cri\"\]$|[plugins.\"io.containerd.grpc.v1.cri\"]\n  enable_experimental_restore_via_create = true|" /etc/containerd/config.toml
+    systemctl restart containerd
+    containerd config dump | grep restore_via_create'
+done</code></pre>
+<pre><code class="language-plaintext">    enable_experimental_restore_via_create = true</code></pre>
+<p><strong>Note:</strong> the companion repo&#39;s <code>./setup.sh</code> does everything in this section — cluster, CRIU, containerd flag, image build and load — in one shot.</p>
+<hr>
+<h2 id="give-the-pod-something-to-lose">Give the Pod Something to Lose</h2>
+<p>The pod manifest pins the app to the doomed worker and — importantly — disables the service account token mount:</p>
+<pre><code class="language-yaml"># k8s/counter-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: checkpoint-lab-worker
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  containers:
+    - name: counter
+      image: counter:blog
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1</code></pre>
+<p>Why kill the token mount? A checkpoint records every mount the container had. The projected service-account volume belongs to <em>this specific pod instance</em> — it won&#39;t exist for the restored pod, and containerd restores have been known to get SIGKILLed by the kubelet over exactly this mismatch (<a href="https://github.com/containerd/containerd/issues/12108">containerd#12108</a>). Keep checkpoint candidates boring: no extra volumes they don&#39;t need.</p>
+<p>Deploy it and feed it some state:</p>
+<pre><code class="language-bash">kubectl apply -f k8s/counter-pod.yaml
+kubectl wait --for=condition=ready pod/counter
+POD_IP=$(kubectl get pod counter -o jsonpath='{.status.podIP}')
+for i in $(seq 7); do
+  docker exec checkpoint-lab-control-plane curl -s "http://$POD_IP:8080/"
+done</code></pre>
+<pre><code class="language-plaintext">counter: 1 | pod: counter | process up: 20s
+counter: 2 | pod: counter | process up: 20s
+...
+counter: 7 | pod: counter | process up: 20s</code></pre>
+<p>(We curl from inside the control-plane node because pod IPs aren&#39;t routable from your laptop.)</p>
+<p>Seven requests. Think of that <code>7</code> as three weeks of training progress.</p>
+<p>One last piece of homework <em>while the node is still alive</em>: record how the runtime names our app image. The checkpoint will reference its base image by this exact string, and the survivor node will need to recognize it — and we won&#39;t be able to ask a dead node:</p>
+<pre><code class="language-bash">IMAGE_ID=$(kubectl get pod counter -o jsonpath='{.status.containerStatuses[0].imageID}')
+echo "$IMAGE_ID"</code></pre>
+<pre><code class="language-plaintext">docker.io/library/import-2026-09-04@sha256:a37c9c0cc3a5510616ac2b3b56ef801ed60e92f2e3b6e8b4707fc39c60c610ab</code></pre>
+<p>That odd <code>import-&lt;date&gt;@sha256:...</code> name is how <code>kind load</code> images appear to containerd. Tuck it away; it comes back in the restore section.</p>
+<hr>
+<h2 id="the-two-minute-warning-checkpoint-the-container">The Two-Minute Warning: Checkpoint the Container</h2>
+<p>The metadata service just told us the node dies in 120 seconds. Go.</p>
+<p>The kubelet API requires authentication. On kind, the cluster-admin client certificate from your kubeconfig passes the kubelet&#39;s authorization check, and extracting it is two commands:</p>
+<pre><code class="language-bash">kubectl config view --raw --minify \
+  -o jsonpath='{.users[0].user.client-certificate-data}' | base64 -d &gt; kubelet-client.crt
+kubectl config view --raw --minify \
+  -o jsonpath='{.users[0].user.client-key-data}' | base64 -d &gt; kubelet-client.key
+docker cp kubelet-client.crt checkpoint-lab-worker:/root/
+docker cp kubelet-client.key checkpoint-lab-worker:/root/</code></pre>
+<p>Now the single most important command in this article:</p>
+<pre><code class="language-bash">docker exec checkpoint-lab-worker curl -s --insecure \
+  --cert /root/kubelet-client.crt --key /root/kubelet-client.key \
+  -X POST "https://localhost:10250/checkpoint/default/counter/counter"</code></pre>
+<pre><code class="language-plaintext">{"items":["/var/lib/kubelet/checkpoints/checkpoint-counter_default-counter-2026-09-04T18:14:55Z.tar"]}</code></pre>
+<p>That call returned in about <strong>300 milliseconds</strong>, and the archive is 1.7 MiB. CRIU froze the process, scraped its memory pages and file descriptors and socket state into the tar, and let it keep running — the counter never noticed.</p>
+<p>Don&#39;t take my word for what&#39;s inside — <code>checkpointctl</code> reads the archive:</p>
+<pre><code class="language-bash">docker exec checkpoint-lab-worker checkpointctl show \
+  /var/lib/kubelet/checkpoints/checkpoint-counter_default-counter-2026-09-04T18:14:55Z.tar</code></pre>
+<pre><code class="language-plaintext">+-----------+--------------------------------+--------------+-----------------------+
+| CONTAINER |             IMAGE              |      ID      |        RUNTIME        |
++-----------+--------------------------------+--------------+-----------------------+
+| counter   | docker.io/library/counter:blog | 8e7cb588bd8f | io.containerd.runc.v2 |
++-----------+--------------------------------+--------------+-----------------------+
+| CREATED              | ENGINE     | CHKPT SIZE | ROOT FS DIFF SIZE |
+| 2026-09-04T18:11:48Z | containerd | 1.7 MiB    | 254 B             |</code></pre>
+<p>1.6 MiB of that is raw memory pages — the counter variable is literally in there somewhere.</p>
+<p><strong>Note:</strong> that also means checkpoints contain <em>everything</em> the process had in memory: API keys, session tokens, decrypted secrets. The runtime writes them root-only (<code>0600</code>), and you should treat checkpoint archives with the same care as Secrets. This is one of the reasons the native KEP-5823 design gates restore behind its own RBAC verb.</p>
+<p>To make the loss visible later, send two more requests <em>after</em> the checkpoint:</p>
+<pre><code class="language-bash">docker exec checkpoint-lab-control-plane curl -s "http://$POD_IP:8080/"
+docker exec checkpoint-lab-control-plane curl -s "http://$POD_IP:8080/"</code></pre>
+<pre><code class="language-plaintext">counter: 8 | pod: counter | process up: 3m8s
+counter: 9 | pod: counter | process up: 3m8s</code></pre>
+<p>The live counter is at 9. The checkpoint knows about 7. Requests 8 and 9 are the work you do between your last save and the crash — remember them.</p>
+<hr>
+<h2 id="the-reclaim-kill-the-node">The Reclaim: Kill the Node</h2>
+<p>Time&#39;s up.</p>
+<pre><code class="language-bash">docker stop checkpoint-lab-worker
+kubectl delete node checkpoint-lab-worker
+kubectl get nodes</code></pre>
+<pre><code class="language-plaintext">NAME                           STATUS   ROLES           AGE   VERSION
+checkpoint-lab-control-plane   Ready    control-plane   19m   v1.37.0
+checkpoint-lab-worker2         Ready    &lt;none&gt;          18m   v1.37.0</code></pre>
+<p>On a real cloud this is the part where the hypervisor pulls the plug. Our pod object gets garbage-collected along with the node, and its in-memory counter — now at 9 — is gone.</p>
+<p>Except we have the archive. And here&#39;s a lovely detail: <code>docker cp</code> works on <em>stopped</em> containers, so we can pull the checkpoint off the dead node&#39;s filesystem — the kind equivalent of detaching the EBS volume from a terminated instance:</p>
+<pre><code class="language-bash">docker cp checkpoint-lab-worker:/var/lib/kubelet/checkpoints/checkpoint-counter_default-counter-2026-09-04T18:14:55Z.tar \
+  ./checkpoint.tar
+ls -lh checkpoint.tar</code></pre>
+<pre><code class="language-plaintext">-rw------- 1 skatara wheel 1.7M Sep  4 20:14 checkpoint.tar</code></pre>
+<p><strong>Note:</strong> on a real spot instance you wouldn&#39;t gamble on post-mortem disk access — you&#39;d copy the archive to S3 or another node <em>inside</em> the warning window, right after the checkpoint call. Same sequence, different transport. At 1.7 MiB (or even a few GB for a fat JVM), it fits comfortably inside two minutes.</p>
+<hr>
+<h2 id="resurrection-from-tarball-to-running-pod">Resurrection: From Tarball to Running Pod</h2>
+<p>Kubernetes only knows how to schedule one thing: images. So the restore trick is to disguise our frozen process as one. The disguise needs two parts — the archive contents as the image&#39;s filesystem, and an annotation that containerd recognizes as the secret handshake:</p>
+<pre><code class="language-bash">docker run --rm --privileged -v "$PWD":/work quay.io/buildah/stable:latest bash -c '
+  ctr=$(buildah from scratch)
+  buildah add "$ctr" /work/checkpoint.tar /
+  buildah config --annotation=org.criu.checkpoint.container.name=counter "$ctr"
+  buildah commit "$ctr" checkpoint-image:latest
+  buildah push localhost/checkpoint-image:latest \
+    oci-archive:/work/checkpoint-oci.tar:localhost/checkpoint-image:latest
+'</code></pre>
+<p>Four buildah commands: start <code>from scratch</code> (an empty image), <code>add</code> the archive (which extracts it into the image root), stamp the <strong><code>org.criu.checkpoint.container.name</code></strong> annotation, and export the result as an OCI archive. We run buildah in a throwaway container so this works identically on macOS and Linux.</p>
+<p><strong>Note:</strong> that annotation is containerd&#39;s. CRI-O uses <code>io.kubernetes.cri-o.annotations.checkpoint.name</code> instead — most 2022-era tutorials show the CRI-O one, from the days when containerd couldn&#39;t restore at all.</p>
+<p>Ship it to the survivor and import it — no registry needed:</p>
+<pre><code class="language-bash">docker cp checkpoint-oci.tar checkpoint-lab-worker2:/root/
+docker exec checkpoint-lab-worker2 ctr -n k8s.io images import /root/checkpoint-oci.tar</code></pre>
+<pre><code class="language-plaintext">localhost/checkpoint image:latest    saved
+Importing    elapsed: 0.1 s    total:   0.0 B    (0.0 B/s)</code></pre>
+<p>Now for the quirk I promised. <code>checkpointctl</code> displayed the friendly image name (<code>counter:blog</code>), but during restore containerd re-resolves the checkpoint&#39;s <strong>base image</strong> by the pinned digest reference we saved earlier — two views of the same image: <code>docker.io/library/import-2026-09-04@sha256:...</code>. But the survivor&#39;s image store only knows that image by the <em>unprefixed</em> name <code>import-2026-09-04@sha256:...</code> (a <code>kind load</code> artifact), so containerd misses locally, tries to <em>pull</em> from Docker Hub, and fails — that repository doesn&#39;t exist anywhere. The fix is a one-line alias so the lookup hits locally:</p>
+<pre><code class="language-bash">docker exec checkpoint-lab-worker2 ctr -n k8s.io images tag \
+  "${IMAGE_ID#docker.io/library/}" "$IMAGE_ID"</code></pre>
+<p>On a real cluster your image lives in a registry (ECR, GHCR, anything), the recorded reference is pullable from any node, and this step simply doesn&#39;t exist. It&#39;s the one piece of kind-specific duct tape in the whole demo.</p>
+<p>The restore pod looks almost boringly normal:</p>
+<pre><code class="language-yaml"># k8s/restore-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter-restored
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: checkpoint-lab-worker2
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  containers:
+    - name: counter
+      image: localhost/checkpoint-image:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1</code></pre>
+<pre><code class="language-bash">kubectl apply -f k8s/restore-pod.yaml
+kubectl wait --for=condition=ready pod/counter-restored
+NEW_IP=$(kubectl get pod counter-restored -o jsonpath='{.status.podIP}')
+docker exec checkpoint-lab-control-plane curl -s "http://$NEW_IP:8080/"</code></pre>
+<pre><code class="language-plaintext">counter: 8 | pod: counter | process up: 3m21s</code></pre>
+<p>Read that line slowly. It&#39;s the whole article:</p>
+<ul>
+<li><strong><code>counter: 8</code></strong> — the process resumed from the checkpointed 7 and served the next request as 8. Requests 8 and 9 from before the crash? Lost — everything after your last checkpoint always is, exactly like work since your last <code>torch.save()</code>. But three weeks of progress survived a dead node.</li>
+<li><strong>No warmup.</strong> <code>kubectl logs counter-restored</code> shows the <em>original</em> startup messages, timestamped from before the reclaim — <code>main()</code> never ran again. The 10-second warmup (read: your 10-minute model load) was skipped entirely, because the restored heap already contains its results.</li>
+<li><strong><code>pod: counter</code></strong> — the hostname inside the container is still the <em>old</em> pod&#39;s. CRIU restored the UTS namespace contents along with everything else. The process is running inside pod <code>counter-restored</code>, but it still believes it&#39;s <code>counter</code>.</li>
+<li><strong><code>process up: 3m21s</code></strong> — the process was 3m07s old when we froze it. Its monotonic clock resumed from the freeze point. From the process&#39;s perspective, the node&#39;s death lasted zero seconds.</li>
+</ul>
+<p>One more twist, straight from containerd&#39;s own test suite. Kill the restored process the ugly way:</p>
+<pre><code class="language-bash">docker exec checkpoint-lab-worker2 bash -c 'pgrep -f "^/counter" | xargs kill -9'
+sleep 8
+kubectl get pod counter-restored
+docker exec checkpoint-lab-control-plane curl -s "http://$NEW_IP:8080/"</code></pre>
+<pre><code class="language-plaintext">NAME               READY   STATUS    RESTARTS     AGE
+counter-restored   1/1     Running   1 (8s ago)   3m34s
+counter: 8 | pod: counter | process up: 3m14s</code></pre>
+<p><code>RESTARTS: 1</code>, and the counter is at 8 again — because <code>restartPolicy: Always</code> restarted the container <em>from its image</em>, and its image <strong>is the checkpoint</strong>. Your last save point is now the pod&#39;s respawn point, like a video game.</p>
+<h3 id="does-it-fit-in-the-window">Does it fit in the window?</h3>
+<p>Timings from a scripted end-to-end run on a laptop (<code>./demo.sh</code> in the repo), verified against the pod&#39;s own timestamps — the checkpoint fired at <code>18:39:00Z</code> and the restored pod was <code>Ready</code> at <code>18:39:02Z</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Checkpoint (kubelet API call, CRIU dump)</td>
+<td>~0.3s</td>
+</tr>
+<tr>
+<td>Salvage archive off dead node (<code>docker cp</code>)</td>
+<td>~0.1s</td>
+</tr>
+<tr>
+<td>Convert to OCI image (buildah, image cached)</td>
+<td>~0.8s</td>
+</tr>
+<tr>
+<td>Import on survivor + alias</td>
+<td>~0.3s</td>
+</tr>
+<tr>
+<td>Pod creation → CRIU restore → serving traffic</td>
+<td>~0.5s</td>
+</tr>
+<tr>
+<td><strong>Total, warning → recovered</strong></td>
+<td><strong>~2s</strong></td>
+</tr>
+</tbody></table>
+<p>Two seconds. (Add ~25s the very first time, while Docker pulls the buildah image — pre-pull it if you&#39;re racing a real reclaim.) A 2-minute AWS warning is an eternity for a small service. Memory size is the variable that grows this — CRIU dump time and archive size scale with the process&#39;s dirty pages — which is why the serious end of this technique (GPU training jobs) is also where the engineering gets hard.</p>
+<hr>
+<h2 id="what-just-happened-and-what-didnt">What Just Happened (and What Didn&#39;t)</h2>
+<p>Honesty ledger. What you just built is real, and it has real edges:</p>
+<ul>
+<li><strong>Same-ish machines only.</strong> CRIU restores CPU state; the target needs the same architecture and a compatible kernel. Migrating amd64 → arm64 is science fiction. Within one cloud fleet (same instance family, same AMI) this is a non-issue.</li>
+<li><strong>Established TCP connections don&#39;t survive.</strong> Our curl connections close between requests, so nobody noticed. Long-lived connections get reset on restore — clients need retries.</li>
+<li><strong>The checkpoint is forensic, not a migration.</strong> KEP-2008 leaves the original running; &quot;move&quot; = checkpoint + node death (our case) or checkpoint + delete. A true coordinated freeze-and-move is precisely KEP-5823 territory.</li>
+<li><strong>Volumes, GPUs, multi-container pods</strong> — none of that came along. We checkpointed one container&#39;s process tree. GPU checkpoint/restore exists (<a href="https://arxiv.org/abs/2502.16631">CRIUgpu</a>, NVIDIA&#39;s <code>cuda-checkpoint</code>) but is far beyond one curl call.</li>
+<li><strong>Checkpoints are secrets.</strong> Full memory dump, remember. Root-only on the node, and the reason restore sits behind an experimental flag after <a href="https://github.com/containerd/containerd/security/advisories/GHSA-33vj-92qq-66hc">GHSA-33vj-92qq-66hc</a>.</li>
+<li><strong>The restore path we used is deprecated</strong> — containerd removes restore-via-<code>CreateContainer</code> in v2.4, <em>because the native replacement is coming</em>. Which brings us to the payoff.</li>
+</ul>
+<hr>
+<h2 id="the-future-kep-5823-makes-this-native">The Future: KEP-5823 Makes This Native</h2>
+<p>Count the hats you wore today: cert extractor, checkpoint trigger, disk salvager, image builder, ref aliaser, restore babysitter. Every one of those hats is a job <a href="https://github.com/kubernetes/enhancements/issues/5823">KEP-5823 — Pod-level Checkpoint/Restore</a> gives to Kubernetes itself.</p>
+<p>The design, from SIG Node&#39;s new <a href="https://www.kubernetes.dev/blog/2026/01/21/introducing-checkpoint-restore-wg/">Checkpoint/Restore Working Group</a> (announced January 2026, with interruption-aware scheduling — preempting lower-priority pods <em>while preserving their runtime state</em> — among its motivating use cases):</p>
+<p><strong>Checkpointing becomes an API object</strong> — no kubelet endpoint, no certs:</p>
+<pre><code class="language-yaml">apiVersion: checkpoint.k8s.io/v1alpha1
+kind: PodCheckpoint
+metadata:
+  name: counter-before-reclaim
+spec:
+  sourcePodName: counter</code></pre>
+<p>The kubelet watches <code>PodCheckpoint</code> objects, checkpoints the <em>entire pod</em> (all containers plus sandbox metadata) through a new CRI call, and reports progress in <code>status</code> — <code>Pending → CheckpointInProgress → CheckpointCompleted</code>.</p>
+<p><strong>Restoring becomes one line in the pod spec:</strong></p>
+<pre><code class="language-yaml">spec:
+  restoreFrom: counter-before-reclaim</code></pre>
+<p>Admission validates that the new pod&#39;s spec matches the checkpointed one, RBAC gates restore behind a dedicated verb (remember — checkpoints contain secrets), and the kubelet calls the second new CRI RPC instead of starting containers from scratch.</p>
+<p>Those two CRI RPCs — <code>CheckpointPod</code> and <code>RestorePod</code> — <strong>already shipped</strong>: they&#39;re in the CRI protobuf of the v1.37 release you used today. That&#39;s the plumbing. The user-facing alpha (the <code>PodCheckpoint</code> API, <code>restoreFrom</code>, the <code>PodLevelCheckpointRestore</code> feature gate) was pulled from v1.37 at code freeze and is working through review for an upcoming release — you can watch it land in <a href="https://github.com/kubernetes/kubernetes/pull/140186">kubernetes/kubernetes#140186</a> and <a href="https://github.com/containerd/containerd/pull/13822">containerd#13822</a>.</p>
+<p>Set expectations accordingly: the alpha starts <strong>same-node only</strong> — checkpoint and restore on one machine, aimed first at fast restarts and fault recovery. Cross-node restore and live migration are on the roadmap, and everything you did today is the manual preview of exactly that. The gap between &quot;the alpha&quot; and &quot;your demo&quot; is the gap the working group exists to close.</p>
+<p>When <code>restoreFrom</code> ships, the middle five sections of this article collapse into two YAML files. The mental model you built by hand is the part that won&#39;t be deprecated.</p>
+<hr>
+<h2 id="clean-up">Clean Up</h2>
+<pre><code class="language-bash">kind delete cluster --name checkpoint-lab</code></pre>
+<p>Or <code>./cleanup.sh</code> from the repo, which also removes the demo image.</p>
+<hr>
+<h2 id="conclusion">Conclusion</h2>
+<p>You didn&#39;t read about checkpoint/restore. You froze a running process, pulled its memory off a dead node, disguised it as a container image, and resurrected it on another machine — mid-thought, clock intact, warmup skipped. Here&#39;s the mental model you now carry:</p>
+<ol>
+<li><strong>Spot reclaims are a state-loss problem</strong>, not a scheduling problem — Kubernetes already reschedules pods fine; it&#39;s the memory that dies.</li>
+<li><strong>CRIU can photograph a Linux process</strong> — memory, sockets, file descriptors — and rebuild it so faithfully the process never notices.</li>
+<li><strong>Every kubelet since v1.30 can checkpoint a container</strong> through one authenticated POST — beta, on by default, no configuration.</li>
+<li><strong>Restore is the missing half</strong>: today it&#39;s a runtime trick — checkpoint tar → annotated OCI image → containerd 2.1+ restores on container create.</li>
+<li><strong>The annotation is the handshake</strong>: <code>org.criu.checkpoint.container.name</code> for containerd, a different one for CRI-O.</li>
+<li><strong>A restored process is uncanny</strong>: old hostname, resumed monotonic clock, no warmup, and its checkpoint becomes its respawn point.</li>
+<li><strong>KEP-5823 turns your manual labor into two YAML stanzas</strong> — <code>PodCheckpoint</code> and <code>restoreFrom</code> — with the CRI plumbing already in v1.37.</li>
+</ol>
+<p>The next time a spot node gets its two-minute warning, you&#39;ll know that &quot;graceful shutdown&quot; is only half a plan — and you&#39;ll know, in your bones, what the other half looks like. Happy checkpointing!</p>
+
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>
+  document.querySelectorAll('pre code[class*="language-"]:not(.language-plaintext)')
+    .forEach((el) => hljs.highlightElement(el));
+</script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'neutral' });
+</script>
+</body>
+</html>

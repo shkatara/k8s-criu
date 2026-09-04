@@ -8,7 +8,7 @@ Your laptop already solves this problem: close the lid, open it on the train, an
 
 By the end, you'll have checkpointed a stateful pod during a simulated spot-instance "two-minute warning," killed its node mid-flight, salvaged the checkpoint off the dead node's disk, and watched the *same process* — same counter, same in-memory state, even the same internal clock — come back to life on a surviving node. And you'll understand exactly what KEP-5823 automates, because you'll have been the controller yourself.
 
-All the code and scripts are in the [companion repo](https://github.com/TODO-REPLACE-WITH-REPO-URL). <!-- TODO: replace with the real repo URL before publishing -->
+All the code and scripts are in the [companion repo](https://github.com/shkatara/k8s-criu).
 
 ## Table of Contents
 
