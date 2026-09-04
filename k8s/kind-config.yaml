@@ -1,0 +1,13 @@
+# 3-node cluster: control-plane + 2 workers.
+# kind-worker plays the doomed "spot" node, kind-worker2 is the survivor.
+# Node image pinned to Kubernetes v1.37.0 (kind v0.33.0, containerd 2.3.4).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: checkpoint-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0
+  - role: worker
+    image: kindest/node:v1.37.0
+  - role: worker
+    image: kindest/node:v1.37.0

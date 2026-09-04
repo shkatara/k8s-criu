@@ -1,0 +1,25 @@
+# The stateful workload, pinned to the doomed "spot" node.
+# automountServiceAccountToken: false keeps the checkpoint free of
+# pod-specific volume mounts that would not exist in the restored pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter
+  labels:
+    app: counter
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: checkpoint-lab-worker
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  containers:
+    - name: counter
+      image: counter:blog
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8080
+      # Ready only once the (10s) warmup is done and the port is open.
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1

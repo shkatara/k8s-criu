@@ -1,0 +1,26 @@
+# The resurrection: same container shape, but the image is the checkpoint
+# archive we converted to an OCI image. containerd sees the
+# org.criu.checkpoint.container.name annotation on the image and CRIU-restores
+# the original process instead of starting a fresh one.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter-restored
+  labels:
+    app: counter
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: checkpoint-lab-worker2
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  containers:
+    - name: counter
+      image: localhost/checkpoint-image:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8080
+      # The restored process is already warm — this goes Ready immediately.
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 1
