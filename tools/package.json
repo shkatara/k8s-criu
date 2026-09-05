@@ -1,0 +1,9 @@
+{
+  "name": "blog-tools",
+  "private": true,
+  "type": "module",
+  "description": "Regenerates index.html from BLOG.md: npm install && node convert.mjs",
+  "dependencies": {
+    "marked": "^18.0.11"
+  }
+}
