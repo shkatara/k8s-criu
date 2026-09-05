@@ -2,7 +2,7 @@
 
 Companion repo for the article **"How to Move a Running Pod Between Kubernetes Nodes and Survive Spot Instance Reclaims"** ([BLOG.md](BLOG.md)).
 
-A stateful pod runs on a kind worker playing the role of a cloud spot instance. When the "two-minute warning" fires, we checkpoint the container with CRIU via the kubelet API (KEP-2008), kill the node, salvage the checkpoint archive off its disk, wrap it in an annotated OCI image, and restore the *same process* — counter, clock, warmed-up state and all — on a surviving node. Then we look at how [KEP-5823 (Pod-level Checkpoint/Restore)](https://github.com/kubernetes/enhancements/issues/5823) makes all of this native.
+A stateful pod runs on a kind worker playing the role of a cloud spot instance. When the "two-minute warning" fires, we checkpoint the container with CRIU via the kubelet API (KEP-2008), kill the node, salvage the checkpoint archive off its disk, wrap it in an annotated OCI image, and restore the *same process* (counter, clock, warmed-up state and all) on a surviving node. Then we look at how [KEP-5823 (Pod-level Checkpoint/Restore)](https://github.com/kubernetes/enhancements/issues/5823) makes all of this native.
 
 ---
 
@@ -36,7 +36,7 @@ graph TD
 * [kind](https://kind.sigs.k8s.io/) **>= v0.33.0** (pinned: `kindest/node:v1.37.0`, containerd 2.3.4)
 * [kubectl](https://kubernetes.io/docs/tasks/tools/)
 
-Works on amd64 and arm64 (Apple Silicon). Your Docker VM's kernel must pass `criu check` — `setup.sh` verifies this for you.
+Works on amd64 and arm64 (Apple Silicon). Your Docker VM's kernel must pass `criu check`; `setup.sh` verifies this for you.
 
 ---
 
@@ -61,14 +61,14 @@ Follow [BLOG.md](BLOG.md) for the full walkthrough with explanations. In short:
 3. **Checkpoint**: extract client cert/key from kubeconfig, `POST https://localhost:10250/checkpoint/default/counter/counter` on the worker. Inspect with `checkpointctl show`.
 4. **Reclaim**: `docker stop checkpoint-lab-worker`, `kubectl delete node checkpoint-lab-worker`, salvage the tar with `docker cp` (works on stopped containers).
 5. **Convert**: buildah `from scratch` + `add` tar + annotation `org.criu.checkpoint.container.name=counter` + `commit` + `push` to an `oci-archive`.
-6. **Restore**: `ctr -n k8s.io images import` on worker2, alias the recorded base-image ref (`ctr images tag "$IMAGE_ID" "docker.io/library/$IMAGE_ID"` — kind-only quirk), `kubectl apply -f k8s/restore-pod.yaml`.
+6. **Restore**: `ctr -n k8s.io images import` on worker2, alias the recorded base-image ref (`ctr images tag "$IMAGE_ID" "docker.io/library/$IMAGE_ID"`, a kind-only quirk), `kubectl apply -f k8s/restore-pod.yaml`.
 
 ---
 
 ## Verifying the Restore
 
-* The first request to `counter-restored` continues from the checkpointed counter value (post-checkpoint requests are lost — that's the point of the demo).
-* `kubectl logs counter-restored` shows the *original* warmup timestamps — `main()` never re-ran.
+* The first request to `counter-restored` continues from the checkpointed counter value (post-checkpoint requests are lost; that's the point of the demo).
+* `kubectl logs counter-restored` shows the *original* warmup timestamps: `main()` never re-ran.
 * The response still reports the old pod's hostname and a monotonic uptime resumed from the freeze point.
 * `kill -9` the restored process: the kubelet restarts it *from the checkpoint image again*.
 

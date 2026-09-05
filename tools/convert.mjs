@@ -52,7 +52,7 @@ const html = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How to Move a Running Pod Between Kubernetes Nodes and Survive Spot Instance Reclaims</title>
-<meta name="description" content="Freeze a live pod with CRIU, carry it off a dying spot node, and restore it on another one — by hand, on kind. A hands-on preview of Kubernetes KEP-5823.">
+<meta name="description" content="Freeze a live pod with CRIU, carry it off a dying spot node, and restore it on another one, by hand, on kind. A hands-on preview of Kubernetes KEP-5823.">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <style>
   :root {
